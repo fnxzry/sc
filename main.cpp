@@ -2,6 +2,8 @@
 NEXT:
 - test
 - call code in a seq and push the result - rather than retaining?
+  - no, that doesn't make sense for static ifs for example
+- parens
 - varargs
 - overloading
 - comments
@@ -101,7 +103,9 @@ enum class literal {
 
 struct func {
   std::string name;
-  int precedence;
+  int left_power;
+  int right_power;
+  std::vector<std::func<void(unit)>> 
   int prefix;
   int suffix;
   std::function<void(const unit *)> impl;
@@ -142,13 +146,15 @@ struct name {
   std::string n;
 };
 
+using group = std::vector<unit>;
+
 struct unit {
   using unit_type = std::variant<
     nullptr_t,
     int64_t,
     std::string,
     name,
-    std::vector<unit>,
+    group,
     func,
     code
   >;
@@ -179,7 +185,7 @@ operator<<(std::ostream &os, literal u) {
 
 std::ostream &
 operator<<(std::ostream &os, const func &f) {
-  return os << f.prefix << "/" << f.name << "/" << f.suffix << "(" << f.precedence << ")";
+  return os << f.prefix << "/" << f.name << "/" << f.suffix << "(" << f.left_power << "/" << f.right_power << ")";
 }
 
 std::ostream &
@@ -203,14 +209,11 @@ operator<<(std::ostream &os, const unit &u) {
   return os;
 }
 
-using unit_queue = std::vector<unit>;
-std::vector<unit_queue> units = {};
-std::vector<code *> scopes = {};
+std::vector<unit> units;
+std::vector<code *> scopes;
 
 std::istream &in = std::cin;
 
-static unit_queue &
-curunits() { return units.back(); }
 static code &
 curscope() { return *scopes.back(); }
 
@@ -293,30 +296,16 @@ read_unit() {
     log::error << "I/O error" << log::end;
   }
   if (c == '"') {
-    log::debug << "string" << log::end;
     in.get();
     return read_string();
   }
-  else if (c == '{') {
-    in.get();
-    code c;
-    seq(c);
-    return unit{c};
-  }
-  else if (c == '}') {
-    in.get();
-    return unit{};
-  }
   else if (std::isdigit(c)) {
-    log::debug << "number" << log::end;
     return unit{std::stoll(read_token(&isdigit))};
   }
   else if (isnamechar(c)) {
-    log::debug << "txt name" << log::end;
     return unit{name{read_token(&isnamechar)}};
   }
   else if (std::ispunct(c)) {
-    log::debug << "sym name" << log::end;
     return unit{name{read_token(&ispunct)}};
   }
   else {
@@ -327,7 +316,7 @@ read_unit() {
 
 static void
 builtin_stack(const unit *) {
-  log::debug << curunits() << log::end;
+  log::debug << units << log::end;
 }
 
 static void
@@ -361,6 +350,19 @@ builtin_invoke(const unit *args) {
   c->invoke();
 }
 
+static void
+builtin_fn(const unit *args) {
+  const group *g = std::get_if<group>(&args[0].u);
+  if (!g) {
+    log::error << "invoke: arg 0 is not a group" << log::end;
+  }
+  const code *c = std::get_if<code>(&args[1].u);
+  if (!c) {
+    log::error << "invoke: arg 1 is not code" << log::end;
+  }
+   
+}
+
 static void getunit(int prec);
 
 static void
@@ -369,6 +371,7 @@ callf(const func *f, std::vector<unit> &args, size_t at) {
     log::error << f->name << " requires " << f->suffix << " suffix args but " << (args.size() - at) << " available" << log::end;
   }
   auto i = args.begin() + at;
+  log::debug << "trycall " << f->name << log::end;
   if (f->impl) {
     if (scopes.size() == 1) {
       log::debug << "call " << f->name << " " << std::vector<unit>{i - f->prefix, i + f->suffix} << log::end;
@@ -395,6 +398,11 @@ resolve(const unit &in) {
   return out;
 }
 
+const static int min_power = std::numeric_limits<int>::min();
+const static int max_power = std::numeric_limits<int>::max();
+
+static const func basefunc = { "", min_power, min_power, 0, 0, nullptr };
+
 static const func *
 expr(const func *f, std::vector<unit> &args, size_t at) {
   log::debug << f->name << " " << args << " " << at << log::end;
@@ -406,11 +414,7 @@ expr(const func *f, std::vector<unit> &args, size_t at) {
   const unit *ru = resolve(u);
   const func *next = std::get_if<func>(&ru->u);
   if (next) {
-    if (next->prefix + next->suffix == 0) {
-      callf(next, args, at);
-      return expr(f, args, args.size());
-    }
-    while (next && next->precedence > f->precedence) {
+    while (next && next->left_power > f->right_power) {
       log::debug << "resolving next " << next->name << log::end;
       if (args.size() - at < next->prefix) {
         log::error << next->name << " requires " << next->prefix << " prefix args but " << args.size() - at << " available" << log::end;
@@ -422,6 +426,7 @@ expr(const func *f, std::vector<unit> &args, size_t at) {
       next = expr(next, args, args.size());
     }
     callf(f, args, at);
+    log::debug << "ret " << next->name << log::end;
     return next;
   }
   else {
@@ -434,41 +439,102 @@ expr(const func *f, std::vector<unit> &args, size_t at) {
 static void
 seq(code &C) {
   scopes.emplace_back(&C);
-  static const func basefunc = { "", std::numeric_limits<int>::min(), 0, 0, nullptr };
-  auto at = curunits().size();
-  const func *f = expr(&basefunc, curunits(), at);
-  if (f != nullptr) {
-    log::error << "uncalled function " << f->name << log::end;
-  }
-  if (curunits().size() != at) {//!curunits().empty()) {
-    log::error << "unconsumed arguments " << curunits() << log::end;
+  auto at = units.size();
+  for (const func *f = &basefunc; f; f = expr(f, units, units.size()))
+    std::cout << "loop";
+    ;
+  if (units.size() != at) {
+    log::error << "unconsumed arguments " << std::vector<unit>{units.begin() + at, units.end()} << log::end;
   }
   scopes.pop_back();
+}
+
+static void builtin_start(const unit *);
+static void builtin_paren(const unit *);
+
+  code base = { {
+    { "__stack",
+      unit{func{"__stack", 0, 0, 0, 0, &builtin_stack}}
+    },
+    { "__scope",
+      unit{func{"__scope", 0, 0, 0, 0, &builtin_scope}}
+    },
+    { "__dump",
+      unit{func{"__dump", 0, 0, 0, 1, &builtin_dump}},
+    },
+    { "__def",
+      unit{func{"__def", 0, 0, 0, 2, &builtin_def}}
+    },
+    { "__invoke",
+      unit{func{"__invoke", 0, 0, 1, 0, &builtin_invoke}}
+    },
+    { ";",
+      unit{func{";", min_power, max_power, 0, 0, nullptr}}
+    },
+    { ",",
+      unit{func{",", min_power, max_power, 0, 0, nullptr}}
+    },
+    { "{",
+      unit{func{"{", min_power + 1, max_power, 0, 0, &builtin_start}}
+    },
+    { "}",
+      unit{func{"}", min_power, max_power, 0, 0, nullptr}}
+    },
+    { "(",
+      unit{func{"(", max_power, max_power, 0, 0, &builtin_paren}}
+    },
+    { ")",
+      unit{func{")", min_power, max_power, 0, 0, nullptr}}
+    },
+    { "fn",
+      unit{func{"fn", 0, 0, 0, 2, &builtin_fn}}
+    }
+  }, {} };
+
+static void
+builtin_start(const unit *) {
+  code C;
+  scopes.emplace_back(&C);
+  const func *end = std::get_if<func>(&base.scope["}"].u);
+  auto at = units.size();
+  const func *f;
+  for (f = &basefunc; f && f != end; f = expr(f, units, units.size()))
+    ;
+  if (f != end) {
+    log::error << "mismatched brace" << log::end;
+  }
+  if (units.size() != at) {
+    log::error << "unconsumed arguments " << units << log::end;
+  }
+  scopes.pop_back();
+  units.emplace_back(C);
+}
+
+static void
+builtin_paren(const unit *) {
+  const func *sep = std::get_if<func>(&base.scope[","].u);
+  const func *end = std::get_if<func>(&base.scope[")"].u);
+  size_t at = units.size();
+  const func *f;
+  bool is_group = false;
+  for (f = &basefunc; f && f != end; f = expr(f, units, units.size())) {
+    if (f == sep) {
+      is_group = true;
+    }
+  }
+  if (f != end) {
+    log::error << "mismatched parens" << log::end;
+  }
+  if (is_group) {
+    std::vector<unit> G{units.begin() + at, units.end()};
+    units.erase(units.begin() + at, units.end());
+    units.emplace_back(group{std::move(G)});
+  }
 }
 
 int
 main(int, char *[]) {
   log::setlevel(log::debug_level);
-
-  code base = { {
-    { "__stack",
-      unit{func{"__stack", 0, 0, 0, &builtin_stack}}
-    },
-    { "__scope",
-      unit{func{"__scope", 0, 0, 0, &builtin_scope}}
-    },
-    { "__dump",
-      unit{func{"__dump", 0, 0, 1, &builtin_dump}},
-    },
-    { "__def",
-      unit{func{"__def", 0, 0, 2, &builtin_def}}
-    },
-    { "__invoke",
-      unit{func{"__invoke", 0, 1, 0, &builtin_invoke}}
-    },
-  }, {} };
-
-  units.emplace_back();
   seq(base);
   return 0;
 }
